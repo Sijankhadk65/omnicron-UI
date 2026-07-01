@@ -11,3 +11,10 @@ __pycache__/
 # OS / editor
 .DS_Store
 *.swp
+
+# Orbbec SDK runtime logs
+Log/
+
+# Calibration artifacts (machine-specific)
+T_base_cam.npy
+T_base_cam.meta.json
