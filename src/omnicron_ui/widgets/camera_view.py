@@ -243,7 +243,11 @@ class CameraView(QtWidgets.QWidget):
         length = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
         text = (f"line: P1({p1[0]:.0f},{p1[1]:.0f}) "
                 f"P2({p2[0]:.0f},{p2[1]:.0f})  {length:.0f}px")
-        if det.has_camera_xyz:
+        if det.has_base_xyz:
+            b1, b2 = det.base1, det.base2
+            text += (f"  |  base mm P1({b1[0]:.0f},{b1[1]:.0f},{b1[2]:.0f}) "
+                     f"P2({b2[0]:.0f},{b2[1]:.0f},{b2[2]:.0f})")
+        elif det.has_camera_xyz:
             c1, c2 = det.cam1, det.cam2
             text += (f"  |  cam mm P1({c1[0]:.0f},{c1[1]:.0f},{c1[2]:.0f}) "
                      f"P2({c2[0]:.0f},{c2[1]:.0f},{c2[2]:.0f})")

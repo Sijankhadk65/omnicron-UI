@@ -211,6 +211,8 @@ class CalibrationPanel(QtWidgets.QGroupBox):
                                           self._last_solve.meta)
         self._log(f"Saved {path.resolve()} (+ quality sidecar) — camera XYZ → "
                   "base XYZ", "success")
+        # Hot-reload: detections start reporting robot base coords immediately.
+        self._camera_view.service.reload_transform()
         self._refresh()
 
     # --- view state -------------------------------------------------------------

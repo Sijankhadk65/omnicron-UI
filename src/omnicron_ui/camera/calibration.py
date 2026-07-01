@@ -175,6 +175,33 @@ def load_transform(path: Path = OUT_FILE) -> tuple[np.ndarray, dict | None] | No
     return T, meta
 
 
+# Usability gate thresholds: a coplanar capture leaves the Z fit unconstrained
+# (this produced a degenerate T_base_cam before), and a very poor fit is worse
+# than no transform — refuse both rather than move the robot with them.
+REJECT_RESID_MM = 10.0
+
+
+def transform_usable(meta: dict | None) -> tuple[bool, str]:
+    """Load guard for a saved T_base_cam: (usable, reason).
+
+    Mirrors red_line_viewer's guard: refuse a nearly-coplanar capture (weak/
+    unconstrained Z fit) or a fit whose mean residual is hopeless. A missing
+    sidecar is allowed but flagged — the transform predates the quality file.
+    """
+    if meta is None:
+        return True, "no quality sidecar — using unverified transform"
+    if meta.get("base_z_spread_mm", 0.0) < Z_SPREAD_WARN_MM:
+        return False, (f"coplanar capture (base Z spread "
+                       f"{meta['base_z_spread_mm']:.0f} mm < {Z_SPREAD_WARN_MM:.0f} mm) "
+                       "— recalibrate with height-varied points")
+    if meta.get("mean_resid_mm", 0.0) > REJECT_RESID_MM:
+        return False, (f"mean residual {meta['mean_resid_mm']:.1f} mm > "
+                       f"{REJECT_RESID_MM:.0f} mm — recalibrate")
+    return True, (f"{meta['n_points']} points, mean residual "
+                  f"{meta['mean_resid_mm']:.2f} mm, Z spread "
+                  f"{meta['base_z_spread_mm']:.0f} mm")
+
+
 @dataclass
 class SolveResult:
     """One fit over the banked pairs, with the residual-gate verdict."""

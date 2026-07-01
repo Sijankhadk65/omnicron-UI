@@ -48,6 +48,9 @@ class CameraService(QObject):
         self._depth_active = False          # what the RUNNING stream actually has
         self._pick_request: tuple[int, int] | None = None
         self._markers: tuple = (None, ())   # (pending px, banked px list)
+        # T_base_cam is loaded on the worker at stream start (and on request
+        # after a new calibration is saved); None = base coords unavailable.
+        self._t_reload = True
         self._thread = QThread()
         self._thread.setObjectName("camera-worker")
         self.moveToThread(self._thread)
@@ -102,6 +105,10 @@ class CameraService(QObject):
         """Calibration overlay: the pending click (cross) + banked points (ticks)."""
         self._markers = (pending, tuple(banked))
 
+    def reload_transform(self) -> None:
+        """Re-read T_base_cam from disk on the next frame (after a new save)."""
+        self._t_reload = True
+
     def stop(self) -> None:
         """Stop the capture loop and wait for the worker thread to finish."""
         self._stop.set()
@@ -130,9 +137,13 @@ class CameraService(QObject):
             self.log.emit(f"Camera open failed: {exc}", "error")
             return
 
+        t_base_cam = None
         try:
             while not self._stop.is_set():
                 try:
+                    if self._t_reload:
+                        self._t_reload = False
+                        t_base_cam = self._load_t_base_cam(calibration)
                     bgr, depth = camera.read_with_depth(timeout_ms=1000)
                     if bgr is None:
                         continue
@@ -146,10 +157,12 @@ class CameraService(QObject):
                         else:
                             endpoints = red_line.detect(bgr, aoi)
                             self._result = self._build_detection(
-                                calibration, red_line, camera, endpoints, depth)
+                                calibration, red_line, camera, endpoints, depth,
+                                t_base_cam)
                             self.line.emit(self._result)
                             self._log_detection(self._result, aoi,
-                                                depth_on=depth is not None)
+                                                depth_on=depth is not None,
+                                                t_loaded=t_base_cam is not None)
                     if self._pick_request is not None:
                         px = self._pick_request
                         self._pick_request = None
@@ -198,19 +211,40 @@ class CameraService(QObject):
         if pending is not None:
             cv.drawMarker(bgr, pending, (0, 255, 255), cv.MARKER_CROSS, 16, 2)
 
+    def _load_t_base_cam(self, calibration):
+        """Load + gate the saved camera→base transform; None if absent/rejected."""
+        loaded = calibration.load_transform()
+        if loaded is None:
+            self.log.emit("No T_base_cam on disk — detections stay in the "
+                          "camera frame until you calibrate", "info")
+            return None
+        T, meta = loaded
+        ok, reason = calibration.transform_usable(meta)
+        if not ok:
+            self.log.emit(f"T_base_cam REJECTED: {reason}", "error")
+            return None
+        self.log.emit(f"T_base_cam loaded — {reason}; detections will include "
+                      "robot base coordinates", "success")
+        return T
+
     @staticmethod
-    def _build_detection(calibration, red_line, camera, endpoints, depth):
-        """Package a detection: pixel endpoints + camera XYZ when depth ran."""
+    def _build_detection(calibration, red_line, camera, endpoints, depth,
+                         t_base_cam):
+        """Package a detection: pixels + camera XYZ + (with T) robot base XYZ."""
         if endpoints is None:
             return None
-        cam1 = cam2 = None
+        cam1 = cam2 = base1 = base2 = None
         if depth is not None and camera.intrinsics is not None:
             cam1, cam2 = calibration.line_to_camera(endpoints, depth,
                                                     camera.intrinsics)
+        if t_base_cam is not None:
+            base1 = calibration.cam_to_base(cam1, t_base_cam) if cam1 is not None else None
+            base2 = calibration.cam_to_base(cam2, t_base_cam) if cam2 is not None else None
         return red_line.LineDetection(p1=endpoints[0], p2=endpoints[1],
-                                      cam1=cam1, cam2=cam2)
+                                      cam1=cam1, cam2=cam2,
+                                      base1=base1, base2=base2)
 
-    def _log_detection(self, det, aoi, depth_on: bool) -> None:
+    def _log_detection(self, det, aoi, depth_on: bool, t_loaded: bool) -> None:
         """Log the result of a one-shot detection (every press logs)."""
         where = "AOI" if aoi is not None else "frame"
         if det is None:
@@ -229,16 +263,26 @@ class CameraService(QObject):
                           "(started color-only). Restart the camera and "
                           "re-detect to get millimetres.", "warn")
             return
-        for label, cam in (("P1", det.cam1), ("P2", det.cam2)):
+        for label, cam, base in (("P1", det.cam1, det.base1),
+                                 ("P2", det.cam2, det.base2)):
             if cam is None:
                 self.log.emit(f"{label}: no depth at the endpoint (hole) — "
                               "retake or nudge the AOI", "warn")
-            else:
+                continue
+            self.log.emit(
+                f"{label} camera frame: x={cam[0]:.1f} mm, y={cam[1]:.1f} mm, "
+                f"z={cam[2]:.1f} mm  (x right, y down, z out from the lens)",
+                "success",
+            )
+            if base is not None:
                 self.log.emit(
-                    f"{label} camera frame: x={cam[0]:.1f} mm, y={cam[1]:.1f} mm, "
-                    f"z={cam[2]:.1f} mm  (x right, y down, z out from the lens)",
+                    f"{label} ROBOT BASE: x={base[0]:.1f} mm, y={base[1]:.1f} mm, "
+                    f"z={base[2]:.1f} mm",
                     "success",
                 )
+        if not t_loaded:
+            self.log.emit("No robot base coords — no usable T_base_cam; run the "
+                          "camera→base calibration to get them", "info")
 
     @staticmethod
     def _to_qimage(bgr: np.ndarray) -> QImage:

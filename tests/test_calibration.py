@@ -21,6 +21,7 @@ from omnicron_ui.camera.calibration import (
     quality_warnings,
     sample_depth_mm,
     save_transform,
+    transform_usable,
     umeyama,
 )
 from omnicron_ui.camera.red_line import LineDetection
@@ -130,6 +131,25 @@ def test_line_detection_without_depth_has_no_camera_xyz():
     assert not det.has_camera_xyz
 
 
+def test_line_detection_base_xyz_via_calibrated_transform():
+    """Camera endpoints mapped through T_base_cam are the robot-ready targets."""
+    T, _, _ = fit_transform(CAM_PTS, BASE_PTS)
+    cam1, cam2 = CAM_PTS[0], CAM_PTS[1]
+    det = LineDetection(p1=np.array([100.0, 100.0]), p2=np.array([200.0, 100.0]),
+                        cam1=cam1, cam2=cam2,
+                        base1=cam_to_base(cam1, T), base2=cam_to_base(cam2, T))
+    assert det.has_base_xyz
+    assert np.allclose(det.base1, BASE_PTS[0], atol=1e-6)
+    assert np.allclose(det.base2, BASE_PTS[1], atol=1e-6)
+
+
+def test_line_detection_one_sided_base_is_not_robot_ready():
+    det = LineDetection(p1=np.array([1.0, 2.0]), p2=np.array([3.0, 4.0]),
+                        cam1=np.array([0.0, 0.0, 500.0]),
+                        base1=np.array([100.0, 600.0, 80.0]))
+    assert not det.has_base_xyz
+
+
 # --- umeyama / fit_transform ---------------------------------------------------------
 
 
@@ -205,6 +225,37 @@ def test_save_and_load_transform_with_sidecar(tmp_path):
 
 def test_load_transform_missing_file_returns_none(tmp_path):
     assert load_transform(tmp_path / "nope.npy") is None
+
+
+# --- transform usability gate --------------------------------------------------------
+
+
+GOOD_META = {"n_points": 6, "scale": 1.0, "mean_resid_mm": 1.5,
+             "max_resid_mm": 3.0, "base_z_spread_mm": 60.0}
+
+
+def test_healthy_transform_is_usable():
+    ok, reason = transform_usable(GOOD_META)
+    assert ok
+    assert "6 points" in reason
+
+
+def test_coplanar_transform_is_rejected():
+    ok, reason = transform_usable({**GOOD_META, "base_z_spread_mm": 3.0})
+    assert not ok
+    assert "coplanar" in reason
+
+
+def test_high_residual_transform_is_rejected():
+    ok, reason = transform_usable({**GOOD_META, "mean_resid_mm": 15.0})
+    assert not ok
+    assert "residual" in reason
+
+
+def test_missing_sidecar_is_allowed_but_flagged():
+    ok, reason = transform_usable(None)
+    assert ok
+    assert "unverified" in reason
 
 
 # --- CalibrationSession ---------------------------------------------------------------
