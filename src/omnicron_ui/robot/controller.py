@@ -31,6 +31,15 @@ def _ret_level(ret: int) -> str:
     return "success" if ret == 0 else "error"
 
 
+def _fmt(vals) -> str:
+    """Compact [a, b, c] formatter for poses / joint vectors in logs."""
+    return "[" + ", ".join(f"{v:.1f}" for v in vals) + "]"
+
+
+# Default PTP speed as a percentage of max (kept low for safe testing).
+DEFAULT_VEL = 20.0
+
+
 class RobotError(RuntimeError):
     """Raised when an SDK call returns a non-zero error code."""
 
@@ -100,6 +109,63 @@ class RobotController:
         self._require_connection()
         ret = self.robot.ResetAllError()
         self.log(f"ResetAllError returned {ret}", _ret_level(ret))
+        return ret
+
+    # --- PTP motion ---------------------------------------------------------
+
+    def move_ptp_joints(self, joints, vel: float = DEFAULT_VEL) -> int:
+        """PTP (MoveJ) straight to an explicit joint configuration.
+
+        ``joints`` is [j1..j6] in degrees. MoveJ moves point-to-point in JOINT
+        space, so this is the most direct/robust PTP — no IK, no reachability
+        surprises (the joints are the target).
+        """
+        self._require_connection()
+        joints = [float(j) for j in joints]
+        if len(joints) != 6:
+            raise RobotError(f"Expected 6 joint values, got {len(joints)}.")
+        self.log(f"PTP → joints {_fmt(joints)} @ vel={vel}%", "info")
+        ret = self.robot.MoveJ(joints, self.tool, self.user, vel=float(vel))
+        self.log(f"MoveJ returned {ret}", _ret_level(ret))
+        if ret != 0:
+            raise RobotError(f"MoveJ failed with error code {ret}.")
+        return ret
+
+    def move_ptp_pose(self, x, y, z, rx=None, ry=None, rz=None,
+                      vel: float = DEFAULT_VEL) -> int:
+        """PTP to a base-frame TCP pose: solve IK, then MoveJ to those joints.
+
+        (x, y, z) and (rx, ry, rz) are the TCP pose in the BASE frame — we give
+        the target in base coordinates and the TCP moves there (GetInverseKinRef
+        type=0 = absolute pose in the base frame). Orientation defaults to the
+        robot's CURRENT orientation when rx/ry/rz are omitted, which avoids the
+        no-IK-solution errors an arbitrary orientation can trigger.
+
+        IK is seeded with the current joints (GetInverseKinRef) so it returns the
+        solution nearest the current arm configuration — a natural, predictable
+        move rather than an arbitrary elbow flip.
+        """
+        self._require_connection()
+        current = self.robot.GetActualTCPPose()[1]
+        current_joints = self.robot.GetActualJointPosDegree()[1]
+        target = [
+            float(x), float(y), float(z),
+            current[3] if rx is None else float(rx),
+            current[4] if ry is None else float(ry),
+            current[5] if rz is None else float(rz),
+        ]
+        self.log(f"PTP → base pose {_fmt(target)}: solving IK…", "info")
+        err, joints = self.robot.GetInverseKinRef(0, target, current_joints)
+        if err != 0 or joints is None:
+            raise RobotError(
+                f"No IK solution for base pose {_fmt(target)} (error {err})."
+            )
+        self.log(f"IK ok → joints {_fmt(joints)}; MoveJ @ vel={vel}%", "info")
+        ret = self.robot.MoveJ(joints, self.tool, self.user, desc_pos=target,
+                               vel=float(vel))
+        self.log(f"MoveJ returned {ret}", _ret_level(ret))
+        if ret != 0:
+            raise RobotError(f"MoveJ failed with error code {ret}.")
         return ret
 
     # --- helpers ------------------------------------------------------------

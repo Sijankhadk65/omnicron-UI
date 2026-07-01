@@ -105,6 +105,18 @@ class RobotService(QObject):
     def reset_error(self) -> None:
         self.submit("reset_error", lambda ctrl: ctrl.reset_error())
 
+    def move_ptp_joints(self, joints, vel: float = 20.0) -> None:
+        """PTP to an explicit joint configuration (runs on the worker thread)."""
+        self.submit("ptp_joints", lambda ctrl: ctrl.move_ptp_joints(joints, vel))
+
+    def move_ptp_pose(self, x, y, z, rx=None, ry=None, rz=None,
+                      vel: float = 20.0) -> None:
+        """PTP to a base-frame pose via IK (runs on the worker thread)."""
+        self.submit(
+            "ptp_pose",
+            lambda ctrl: ctrl.move_ptp_pose(x, y, z, rx, ry, rz, vel),
+        )
+
     def shutdown(self) -> None:
         """Stop the worker thread cleanly. Call from the UI thread on app exit."""
         # Queue a teardown on the worker thread (stop the timer, close the RPC),

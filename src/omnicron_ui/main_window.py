@@ -13,6 +13,7 @@ from PySide6 import QtGui, QtWidgets
 from omnicron_ui.robot.service import RobotService
 from omnicron_ui.widgets.connection_panel import ConnectionPanel
 from omnicron_ui.widgets.log_panel import LogPanel
+from omnicron_ui.widgets.ptp_panel import PtpPanel
 
 APP_TITLE = "Omnicron — Fairino Welding Robot"
 
@@ -34,12 +35,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_central(self) -> None:
         self.connection_panel = ConnectionPanel(self.service)
+        self.ptp_panel = PtpPanel(self.service)
         self.log_panel = LogPanel()
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(self.connection_panel)
+        layout.addWidget(self.ptp_panel)
         layout.addWidget(QtWidgets.QLabel("Log"))
         layout.addWidget(self.log_panel, 1)
         self.setCentralWidget(central)
