@@ -14,3 +14,7 @@ __pycache__/
 
 # Orbbec SDK runtime logs
 Log/
+
+# Calibration artifacts (machine-specific)
+T_base_cam.npy
+T_base_cam.meta.json

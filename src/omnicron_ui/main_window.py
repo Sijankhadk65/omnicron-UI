@@ -11,6 +11,7 @@ from __future__ import annotations
 from PySide6 import QtGui, QtWidgets
 
 from omnicron_ui.robot.service import RobotService
+from omnicron_ui.widgets.calibration_panel import CalibrationPanel
 from omnicron_ui.widgets.camera_view import CameraView
 from omnicron_ui.widgets.connection_panel import ConnectionPanel
 from omnicron_ui.widgets.log_panel import LogPanel
@@ -37,6 +38,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_view = CameraView()
         self.camera_view.log.connect(self._on_log)   # camera actions -> Log panel
         self.connection_panel = ConnectionPanel(self.service)
+        self.calibration_panel = CalibrationPanel(self.camera_view, self.service)
         self.log_panel = LogPanel()
 
         # Right column: robot controls on top, log below.
@@ -44,6 +46,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self.connection_panel)
+        right_layout.addWidget(self.calibration_panel)
         right_layout.addWidget(QtWidgets.QLabel("Log"))
         right_layout.addWidget(self.log_panel, 1)
 

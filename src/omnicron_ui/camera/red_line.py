@@ -11,6 +11,8 @@ An AOI is a ``(x1, y1, x2, y2)`` rectangle in full-frame pixel coordinates, or
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2 as cv
 import numpy as np
 
@@ -22,6 +24,30 @@ MIN_ELONGATION = 3.0   # long/short side ratio to qualify as a line, not a blob
 
 AOI = tuple[int, int, int, int]
 Endpoints = tuple[np.ndarray, np.ndarray]
+
+
+@dataclass(frozen=True)
+class LineDetection:
+    """One detected red line: pixel endpoints + (when depth ran) camera XYZ.
+
+    ``cam1``/``cam2`` are camera-frame mm from aligned depth + intrinsics, or
+    None per endpoint when depth had a hole there — and both None when the
+    stream is color-only. They are what ``calibration.cam_to_base`` maps to
+    robot base coordinates.
+    """
+
+    p1: np.ndarray
+    p2: np.ndarray
+    cam1: np.ndarray | None = None
+    cam2: np.ndarray | None = None
+
+    @property
+    def endpoints(self) -> Endpoints:
+        return self.p1, self.p2
+
+    @property
+    def has_camera_xyz(self) -> bool:
+        return self.cam1 is not None and self.cam2 is not None
 
 
 def build_red_mask(image, diff=RED_DIFF, min_val=RED_MIN_VALUE, lab_mode=False):

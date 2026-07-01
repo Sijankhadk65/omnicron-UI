@@ -116,6 +116,21 @@ class CameraView(QtWidgets.QWidget):
         self._frame_wh: tuple[int, int] | None = None
         self._last_frame: QImage | None = None
         self._aoi: tuple[int, int, int, int] | None = None
+        self._pick_mode = False   # calibration: clicks sample a depth point
+
+    @property
+    def service(self) -> CameraService:
+        """The camera worker service (for panels that need its signals)."""
+        return self._service
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def set_pick_mode(self, on: bool) -> None:
+        """Calibration mode: plain clicks on the video pick a depth point
+        (AOI drags still work — only sub-10px 'drags' count as clicks)."""
+        self._pick_mode = on
 
     # --- start/stop ---
     def _on_toggle(self) -> None:
@@ -164,7 +179,14 @@ class CameraView(QtWidgets.QWidget):
             return
         x1, x2 = sorted((p1[0], p2[0]))
         y1, y2 = sorted((p1[1], p2[1]))
-        if x2 - x1 < 10 or y2 - y1 < 10:   # ignore tiny/accidental drags
+        if x2 - x1 < 10 and y2 - y1 < 10:
+            # A tiny drag is a CLICK: in calibration mode it picks a depth point.
+            if self._pick_mode:
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                self.log.emit(f"Sampling depth at ({cx},{cy})…", "info")
+                self._service.pick_point(cx, cy)
+            return
+        if x2 - x1 < 10 or y2 - y1 < 10:   # ignore thin/accidental drags
             self.log.emit("AOI too small — ignored", "warn")
             return
         self._aoi = (x1, y1, x2, y2)
@@ -212,15 +234,20 @@ class CameraView(QtWidgets.QWidget):
     def _on_status(self, text: str) -> None:
         self.status_lbl.setText(text)
 
-    def _on_line(self, endpoints) -> None:
-        if endpoints is None:
+    def _on_line(self, det) -> None:
+        """Show the detection: pixel endpoints, plus camera-frame mm with depth."""
+        if det is None:
             self.status_lbl.setText("no red line")
             return
-        p1, p2 = endpoints
+        p1, p2 = det.endpoints
         length = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
-        self.status_lbl.setText(
-            f"line: P1({p1[0]:.0f},{p1[1]:.0f}) P2({p2[0]:.0f},{p2[1]:.0f})  {length:.0f}px"
-        )
+        text = (f"line: P1({p1[0]:.0f},{p1[1]:.0f}) "
+                f"P2({p2[0]:.0f},{p2[1]:.0f})  {length:.0f}px")
+        if det.has_camera_xyz:
+            c1, c2 = det.cam1, det.cam2
+            text += (f"  |  cam mm P1({c1[0]:.0f},{c1[1]:.0f},{c1[2]:.0f}) "
+                     f"P2({c2[0]:.0f},{c2[1]:.0f},{c2[2]:.0f})")
+        self.status_lbl.setText(text)
 
     def _on_stopped(self) -> None:
         self._running = False
