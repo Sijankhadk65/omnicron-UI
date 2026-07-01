@@ -38,7 +38,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 
-from omnicron_ui.robot.controller import RobotController
+from omnicron_ui.robot.controller import RobotController, WeldParams
 
 # A job body: takes the controller, returns anything (delivered via job_done).
 JobFn = Callable[[RobotController], Any]
@@ -104,6 +104,81 @@ class RobotService(QObject):
 
     def reset_error(self) -> None:
         self.submit("reset_error", lambda ctrl: ctrl.reset_error())
+
+    # Motion methods are orchestration entry points for program logic (task
+    # sequences, the vision pipeline) — they are never wired to direct-movement
+    # UI controls.
+
+    def move_home(self, vel: float = 20.0) -> None:
+        """Park the arm at the home joint configuration (worker thread)."""
+        self.submit("home", lambda ctrl: ctrl.move_home(vel))
+
+    def move_ptp_joints(self, joints, vel: float = 20.0) -> None:
+        """PTP to a known joint configuration (runs on the worker thread)."""
+        self.submit("ptp_joints", lambda ctrl: ctrl.move_ptp_joints(joints, vel))
+
+    def move_ptp_pose(self, x, y, z, rx=None, ry=None, rz=None,
+                      vel: float = 20.0) -> None:
+        """PTP to a camera-derived base-frame target via IK (worker thread).
+
+        (x, y, z) is expected to come from the camera→base transform, not from
+        user-typed coordinates.
+        """
+        self.submit(
+            "ptp_pose",
+            lambda ctrl: ctrl.move_ptp_pose(x, y, z, rx, ry, rz, vel),
+        )
+
+    def move_linear(self, x, y, z, rx=None, ry=None, rz=None, vel: float = 20.0,
+                    speed_mms: float | None = None) -> None:
+        """Straight-line MoveL to a base-frame target (worker thread).
+
+        ``speed_mms`` switches to physical mode (real mm/s travel speed).
+        """
+        self.submit(
+            "linear",
+            lambda ctrl: ctrl.move_linear(x, y, z, rx, ry, rz, vel=vel,
+                                          speed_mms=speed_mms),
+        )
+
+    def move_linear_torch_down(self, x, y, z, vel: float = 20.0) -> None:
+        """MoveL to a base-frame target with an auto-solved torch-down RPY."""
+        self.submit(
+            "linear_torch_down",
+            lambda ctrl: ctrl.move_linear_torch_down(x, y, z, vel=vel),
+        )
+
+    def move_along_line(self, p1, p2, vel: float = 20.0,
+                        speed_mms: float | None = None,
+                        weld: WeldParams | None = None, **kwargs) -> None:
+        """Seam pass P1→P2 (approach/descend/traverse/retract; worker thread).
+
+        Endpoints are camera-derived base-frame XYZ. Traverse runs at
+        ``speed_mms`` (physical mode) when given — the weld travel speed.
+        Pass ``weld`` (WeldParams) to make the traverse a weld stroke; the
+        default WeldParams is a DRY weld (live=False, nothing energized).
+        """
+        self.submit(
+            "line_pass",
+            lambda ctrl: ctrl.move_along_line(p1, p2, vel=vel,
+                                              speed_mms=speed_mms, weld=weld,
+                                              **kwargs),
+        )
+
+    # Welding I/O primitives — for bring-up sequences run by program logic
+    # (wire tension, gas check), not for direct-control UI.
+
+    def set_gas(self, on: bool) -> None:
+        """Open/close the shielding gas valve (worker thread)."""
+        self.submit("gas", lambda ctrl: ctrl.set_gas(on))
+
+    def start_wire_feed(self, reverse: bool = False) -> None:
+        """Run the wire feeder cold (no arc); reverse retracts the wire."""
+        self.submit("wire_feed", lambda ctrl: ctrl.start_wire_feed(reverse))
+
+    def stop_wire_feed(self) -> None:
+        """Stop the wire feeder (both directions)."""
+        self.submit("wire_stop", lambda ctrl: ctrl.stop_wire_feed())
 
     def shutdown(self) -> None:
         """Stop the worker thread cleanly. Call from the UI thread on app exit."""
