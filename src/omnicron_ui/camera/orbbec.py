@@ -72,9 +72,7 @@ class OrbbecCamera:
     def read(self, timeout_ms: int = 1000) -> np.ndarray | None:
         """Block for the next color frame; return a BGR ndarray, or None.
 
-        The 336L color stream comes in mirrored left-right, so we flip it
-        horizontally here (``cv.flip(..., 1)``) so every consumer — display, line
-        detection, calibration — sees a correctly-oriented image.
+        Frames are returned in the camera's native orientation (no flip).
         """
         if self._pipeline is None:
             return None
@@ -84,10 +82,7 @@ class OrbbecCamera:
         color = frames.get_color_frame()
         if color is None:
             return None
-        bgr = _color_frame_to_bgr(color)
-        if bgr is None:
-            return None
-        return cv.flip(bgr, 1)
+        return _color_frame_to_bgr(color)
 
     def close(self) -> None:
         if self._pipeline is not None:
