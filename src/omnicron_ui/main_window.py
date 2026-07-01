@@ -35,6 +35,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_central(self) -> None:
         self.camera_view = CameraView()
+        self.camera_view.log.connect(self._on_log)   # camera actions -> Log panel
         self.connection_panel = ConnectionPanel(self.service)
         self.log_panel = LogPanel()
 
