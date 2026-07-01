@@ -11,6 +11,7 @@ from __future__ import annotations
 from PySide6 import QtGui, QtWidgets
 
 from omnicron_ui.robot.service import RobotService
+from omnicron_ui.widgets.camera_view import CameraView
 from omnicron_ui.widgets.connection_panel import ConnectionPanel
 from omnicron_ui.widgets.log_panel import LogPanel
 
@@ -33,15 +34,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def _build_central(self) -> None:
+        self.camera_view = CameraView()
         self.connection_panel = ConnectionPanel(self.service)
         self.log_panel = LogPanel()
+
+        # Right column: robot controls on top, log below.
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.connection_panel)
+        right_layout.addWidget(QtWidgets.QLabel("Log"))
+        right_layout.addWidget(self.log_panel, 1)
+
+        # Left: live camera. Split so the user can resize the video vs. controls.
+        splitter = QtWidgets.QSplitter()
+        splitter.addWidget(self.camera_view)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.addWidget(self.connection_panel)
-        layout.addWidget(QtWidgets.QLabel("Log"))
-        layout.addWidget(self.log_panel, 1)
+        layout.addWidget(splitter)
         self.setCentralWidget(central)
 
     def _on_log(self, message: str, level: str) -> None:
@@ -51,6 +66,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Working…" if busy else "Ready")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        # Tear down the worker thread cleanly before the window goes away.
+        # Tear down the worker threads cleanly before the window goes away.
+        self.camera_view.shutdown()
         self.service.shutdown()
         super().closeEvent(event)
