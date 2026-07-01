@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+from omnicron_ui.robot import geometry
 from omnicron_ui.robot.sdk import Robot
 
 # Log levels the UI understands (info/success/warn/error). Matches the color
@@ -38,6 +39,13 @@ def _fmt(vals) -> str:
 
 # Default PTP speed as a percentage of max (kept low for safe testing).
 DEFAULT_VEL = 20.0
+
+# Default linear acceleration for physical-speed MoveL (mm/s^2).
+DEFAULT_ACCEL = 200.0
+
+# The "home" joint configuration the program parks the arm at between tasks.
+# Same pose used by farino_app; joint values in degrees [j1..j6].
+HOME_JOINTS = [-90.0, -90.0, 85.0, -85.0, -90.0, 0.0]
 
 
 class RobotError(RuntimeError):
@@ -112,10 +120,29 @@ class RobotController:
         return ret
 
     # --- PTP motion ---------------------------------------------------------
+    #
+    # These are INTERNAL orchestration primitives, not user-facing controls.
+    # The UI never exposes direct-movement widgets; motion is sequenced by
+    # program logic:
+    #   * move_ptp_joints — reach known joint configurations (e.g. home).
+    #   * move_ptp_pose   — reach base-frame targets produced by the vision
+    #     pipeline (camera coords put through the camera→base transform).
+
+    def move_home(self, vel: float = DEFAULT_VEL) -> int:
+        """Park the arm at the program's home configuration (PTP in joint space).
+
+        Joint-space PTP is used deliberately: home is a known-good joint
+        configuration, so going straight to the joints avoids IK and any
+        reachability/elbow-flip surprises.
+        """
+        self.log("Moving to home position…", "info")
+        return self.move_ptp_joints(HOME_JOINTS, vel)
 
     def move_ptp_joints(self, joints, vel: float = DEFAULT_VEL) -> int:
         """PTP (MoveJ) straight to an explicit joint configuration.
 
+        Internal primitive — called by program logic to reach named joint
+        configurations (see ``move_home``), never wired to a UI control.
         ``joints`` is [j1..j6] in degrees. MoveJ moves point-to-point in JOINT
         space, so this is the most direct/robust PTP — no IK, no reachability
         surprises (the joints are the target).
@@ -135,10 +162,13 @@ class RobotController:
                       vel: float = DEFAULT_VEL) -> int:
         """PTP to a base-frame TCP pose: solve IK, then MoveJ to those joints.
 
-        (x, y, z) and (rx, ry, rz) are the TCP pose in the BASE frame — we give
-        the target in base coordinates and the TCP moves there (GetInverseKinRef
-        type=0 = absolute pose in the base frame). Orientation defaults to the
-        robot's CURRENT orientation when rx/ry/rz are omitted, which avoids the
+        Internal primitive for vision-driven motion: (x, y, z) is a target in
+        the BASE frame, expected to come from the camera pipeline after the
+        camera→base transform (camera-frame mm mapped through T_base_cam).
+        It is never fed from hand-typed UI coordinates. GetInverseKinRef type=0
+        treats the pose as absolute in the base frame. Orientation defaults to
+        the robot's CURRENT orientation when rx/ry/rz are omitted — camera
+        targets are positions, and reusing the current orientation avoids the
         no-IK-solution errors an arbitrary orientation can trigger.
 
         IK is seeded with the current joints (GetInverseKinRef) so it returns the
@@ -168,7 +198,161 @@ class RobotController:
             raise RobotError(f"MoveJ failed with error code {ret}.")
         return ret
 
+    # --- linear motion ------------------------------------------------------
+    #
+    # Same rules as the PTP section: internal orchestration primitives, never
+    # wired to direct-movement UI. Line endpoints come from the camera→base
+    # transform; move_along_line is the weld-pass skeleton (welding I/O hooks
+    # in around the traverse later).
+
+    def move_linear(self, x, y, z, rx=None, ry=None, rz=None,
+                    vel: float = DEFAULT_VEL, speed_mms: float | None = None,
+                    accel: float = DEFAULT_ACCEL) -> int:
+        """Straight-line MoveL to (x, y, z) in the BASE frame.
+
+        Orientation defaults to the CURRENT one when rx/ry/rz are omitted; pass
+        them to also reorient along the line (MoveL interpolates orientation as
+        well as position, so the TCP travels straight while the tool smoothly
+        rotates to the target RPY).
+
+        Speed is ``vel`` percent by default. Pass ``speed_mms`` for PHYSICAL
+        mode — the real travel speed in mm/s (this is how weld travel speed is
+        commanded). Physical mode uses velAccParamMode=1 with ovl=mm/s and
+        oacc=mm/s², and vel/acc MUST be sent as 100 (full scale) — the SDK
+        defaults (vel=20, acc=0) get the move rejected with error 183.
+        """
+        self._require_connection()
+        current = self.robot.GetActualTCPPose()[1]
+        target = [
+            float(x), float(y), float(z),
+            current[3] if rx is None else float(rx),
+            current[4] if ry is None else float(ry),
+            current[5] if rz is None else float(rz),
+        ]
+        speed = f"{speed_mms:.0f} mm/s" if speed_mms is not None else f"{vel:.0f}%"
+        self.log(f"MoveL → {_fmt(target)} @ {speed}", "info")
+        ret = self._movel(target, vel, speed_mms, accel)
+        self.log(f"MoveL returned {ret}", _ret_level(ret))
+        if ret != 0:
+            hint = (" (physical mode needs vel/acc=100 + real ovl/oacc)"
+                    if ret in (182, 183) else "")
+            raise RobotError(f"MoveL failed with error code {ret}.{hint}")
+        return ret
+
+    def solve_torch_down_rpy(self, x, y, z, min_down: float = 0.7) -> list[float]:
+        """A torch-DOWN [rx, ry, rz] reachable at (x, y, z), nearest to now.
+
+        Tries the candidate orientations, keeps only those whose torch axis
+        points downward (base -Z component ≥ min_down), solves each with
+        GetInverseKinRef seeded with the current joints, and returns the RPY of
+        the solution with the least joint travel. Raises RobotError when no
+        torch-down orientation is reachable (move the work closer or flip
+        geometry.TORCH_AXIS).
+        """
+        self._require_connection()
+        ref_joints = self.robot.GetActualJointPosDegree()[1]
+        best: tuple[float, list[float]] | None = None
+        for rx, ry, rz in geometry.orientation_candidates():
+            if geometry.torch_dir_in_base(rx, ry, rz)[2] > -min_down:
+                continue  # not pointing down enough
+            err, joints = self.robot.GetInverseKinRef(0, [x, y, z, rx, ry, rz],
+                                                      ref_joints)
+            if err != 0 or joints is None:
+                continue
+            travel = sum(abs(a - b) for a, b in zip(joints, ref_joints, strict=True))
+            if best is None or travel < best[0]:
+                best = (travel, [rx, ry, rz])
+        if best is None:
+            raise RobotError(
+                f"No torch-DOWN orientation reachable at ({x}, {y}, {z})."
+            )
+        return best[1]
+
+    def move_linear_torch_down(self, x, y, z, vel: float = DEFAULT_VEL,
+                               speed_mms: float | None = None,
+                               accel: float = DEFAULT_ACCEL) -> int:
+        """MoveL to (x, y, z) with an auto-solved torch-DOWN orientation there.
+
+        The tool reorients along the line to the solved pose — no hand-picked
+        angles needed. Raises RobotError if no torch-down orientation is
+        reachable at the destination (nothing moves in that case).
+        """
+        rpy = self.solve_torch_down_rpy(x, y, z)
+        self.log(f"Torch-down RPY at destination: {_fmt(rpy)}", "info")
+        return self.move_linear(x, y, z, *rpy, vel=vel, speed_mms=speed_mms,
+                                accel=accel)
+
+    def move_along_line(self, p1, p2, vel: float = DEFAULT_VEL,
+                        approach: float = 30.0, standoff: float = 10.0,
+                        speed_mms: float | None = None,
+                        accel: float = DEFAULT_ACCEL, align_yaw: bool = True,
+                        pull: bool = True, yaw_offset: float = 0.0) -> None:
+        """MoveL the TCP along the seam P1→P2: approach, descend, traverse, retract.
+
+        ``p1``/``p2`` are full base-frame XYZ (mm) from the camera→base
+        transform; each endpoint keeps its OWN Z so a tilted seam is followed in
+        3D. Tilt (rx, ry) comes from the current pose — establish a tool-down
+        orientation first (e.g. move_linear_torch_down to above P1).
+
+        ``standoff`` mm is held ABOVE the surface for the whole pass so the tip
+        never touches; approach/retract sit a further ``approach`` mm above
+        that. Positioning legs run at ``vel`` percent; the traverse runs at
+        ``speed_mms`` mm/s (physical mode) when given — that MoveL IS the weld
+        travel speed. Welding I/O (arc/gas) will hook in around the traverse.
+
+        ``align_yaw`` rotates rz about base Z so the torch faces the line
+        (rx/ry kept). ``pull=True`` — the DEFAULT and the project's welding
+        technique — adds 180° so the torch DRAGS against travel (backhand);
+        push is for experiments only.
+
+        Raises RobotError on the first failed leg (remaining legs are skipped).
+        """
+        self._require_connection()
+        pose = self.robot.GetActualTCPPose()[1]
+        rx, ry, rz = pose[3], pose[4], pose[5]
+        if align_yaw:
+            rz_new = geometry.yaw_to_line(rx, ry, rz, p1, p2, pull=pull,
+                                          yaw_offset=yaw_offset)
+            self.log(f"Yaw aligned to line ({'pull/drag' if pull else 'push'}): "
+                     f"rz {rz:.1f} → {rz_new:.1f}°", "info")
+            rz = rz_new
+
+        def point(p, dz: float = 0.0) -> list[float]:
+            # Surface Z + standoff (clear of the surface) + dz (approach lift).
+            return [float(p[0]), float(p[1]), float(p[2]) + standoff + dz,
+                    rx, ry, rz]
+
+        tspeed = f"{speed_mms:.0f} mm/s" if speed_mms is not None else f"{vel:.0f}%"
+        self.log(
+            f"Line pass P1({p1[0]:.1f},{p1[1]:.1f},{p1[2]:.1f}) → "
+            f"P2({p2[0]:.1f},{p2[1]:.1f},{p2[2]:.1f}) standoff=+{standoff:.0f}mm "
+            f"approach=+{approach:.0f}mm traverse={tspeed}", "info")
+
+        def leg(label: str, target, leg_speed_mms: float | None = None) -> None:
+            ret = self._movel(target, vel, leg_speed_mms, accel)
+            self.log(f"MoveL {label}: {ret}", _ret_level(ret))
+            if ret != 0:
+                hint = (" (physical mode needs vel/acc=100 + real ovl/oacc)"
+                        if ret in (182, 183) else "")
+                raise RobotError(f"Leg '{label}' failed with error code {ret}."
+                                 f"{hint}")
+
+        leg("approach over P1", point(p1, approach))
+        leg("descend to P1", point(p1))
+        leg("traverse to P2", point(p2), speed_mms)
+        leg("retract over P2", point(p2, approach))
+
     # --- helpers ------------------------------------------------------------
+
+    def _movel(self, target, vel_pct: float, speed_mms: float | None,
+               accel: float) -> int:
+        """One MoveL. Percentage mode by default; PHYSICAL mode with speed_mms."""
+        if speed_mms is None:
+            return self.robot.MoveL(desc_pos=target, tool=self.tool,
+                                    user=self.user, vel=float(vel_pct))
+        return self.robot.MoveL(desc_pos=target, tool=self.tool, user=self.user,
+                                vel=100.0, acc=100.0, ovl=float(speed_mms),
+                                oacc=float(accel), velAccParamMode=1)
 
     def _require_connection(self) -> None:
         if self.robot is None:

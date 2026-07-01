@@ -105,16 +105,60 @@ class RobotService(QObject):
     def reset_error(self) -> None:
         self.submit("reset_error", lambda ctrl: ctrl.reset_error())
 
+    # Motion methods are orchestration entry points for program logic (task
+    # sequences, the vision pipeline) — they are never wired to direct-movement
+    # UI controls.
+
+    def move_home(self, vel: float = 20.0) -> None:
+        """Park the arm at the home joint configuration (worker thread)."""
+        self.submit("home", lambda ctrl: ctrl.move_home(vel))
+
     def move_ptp_joints(self, joints, vel: float = 20.0) -> None:
-        """PTP to an explicit joint configuration (runs on the worker thread)."""
+        """PTP to a known joint configuration (runs on the worker thread)."""
         self.submit("ptp_joints", lambda ctrl: ctrl.move_ptp_joints(joints, vel))
 
     def move_ptp_pose(self, x, y, z, rx=None, ry=None, rz=None,
                       vel: float = 20.0) -> None:
-        """PTP to a base-frame pose via IK (runs on the worker thread)."""
+        """PTP to a camera-derived base-frame target via IK (worker thread).
+
+        (x, y, z) is expected to come from the camera→base transform, not from
+        user-typed coordinates.
+        """
         self.submit(
             "ptp_pose",
             lambda ctrl: ctrl.move_ptp_pose(x, y, z, rx, ry, rz, vel),
+        )
+
+    def move_linear(self, x, y, z, rx=None, ry=None, rz=None, vel: float = 20.0,
+                    speed_mms: float | None = None) -> None:
+        """Straight-line MoveL to a base-frame target (worker thread).
+
+        ``speed_mms`` switches to physical mode (real mm/s travel speed).
+        """
+        self.submit(
+            "linear",
+            lambda ctrl: ctrl.move_linear(x, y, z, rx, ry, rz, vel=vel,
+                                          speed_mms=speed_mms),
+        )
+
+    def move_linear_torch_down(self, x, y, z, vel: float = 20.0) -> None:
+        """MoveL to a base-frame target with an auto-solved torch-down RPY."""
+        self.submit(
+            "linear_torch_down",
+            lambda ctrl: ctrl.move_linear_torch_down(x, y, z, vel=vel),
+        )
+
+    def move_along_line(self, p1, p2, vel: float = 20.0,
+                        speed_mms: float | None = None, **kwargs) -> None:
+        """Seam pass P1→P2 (approach/descend/traverse/retract; worker thread).
+
+        Endpoints are camera-derived base-frame XYZ. Traverse runs at
+        ``speed_mms`` (physical mode) when given — the weld travel speed.
+        """
+        self.submit(
+            "line_pass",
+            lambda ctrl: ctrl.move_along_line(p1, p2, vel=vel,
+                                              speed_mms=speed_mms, **kwargs),
         )
 
     def shutdown(self) -> None:
