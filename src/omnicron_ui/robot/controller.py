@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from omnicron_ui.robot import geometry
 from omnicron_ui.robot.sdk import Robot
@@ -46,6 +47,33 @@ DEFAULT_ACCEL = 200.0
 # The "home" joint configuration the program parks the arm at between tasks.
 # Same pose used by farino_app; joint values in degrees [j1..j6].
 HOME_JOINTS = [-90.0, -90.0, 85.0, -85.0, -90.0, 0.0]
+
+# Arc strike/extinguish timeout for ARCStart/ARCEnd (ms).
+ARC_TIMEOUT_MS = 10000
+
+
+@dataclass(frozen=True)
+class WeldParams:
+    """Parameters for one weld pass. SAFE BY DEFAULT: live=False is a DRY WELD —
+    the motion is identical to a real pass but nothing is energized (no arc, no
+    gas, no current), matching the weld-test ladder (prove the path first).
+
+    Current/voltage normally come from the WebApp welding process picked by
+    ``arc_num`` (Welder → Welding process parameters), output to the welder over
+    the control-box analog outputs (current=AO0, voltage=AO1; the welder runs in
+    external/analog mode, front-panel knobs bypassed). Set ``current``/
+    ``voltage`` here only to OVERRIDE that process from code.
+
+    ``gas`` defaults False to match the gasless flux-cored setup.
+    """
+
+    live: bool = False          # False = dry run: log the steps, energize nothing
+    io: int = 0                 # ioType: 0 = controller IO, 1 = extended IO
+    arc_num: int = 1            # WebApp welding process number (ARCStart arcNum)
+    current: float | None = None   # A, AO0 override (None = use the process)
+    voltage: float | None = None   # V, AO1 override (None = use the process)
+    gas: bool = False           # open gas around the pass (off for flux-cored)
+    timeout_ms: int = ARC_TIMEOUT_MS
 
 
 class RobotError(RuntimeError):
@@ -286,7 +314,8 @@ class RobotController:
                         approach: float = 30.0, standoff: float = 10.0,
                         speed_mms: float | None = None,
                         accel: float = DEFAULT_ACCEL, align_yaw: bool = True,
-                        pull: bool = True, yaw_offset: float = 0.0) -> None:
+                        pull: bool = True, yaw_offset: float = 0.0,
+                        weld: WeldParams | None = None) -> None:
         """MoveL the TCP along the seam P1→P2: approach, descend, traverse, retract.
 
         ``p1``/``p2`` are full base-frame XYZ (mm) from the camera→base
@@ -298,12 +327,19 @@ class RobotController:
         never touches; approach/retract sit a further ``approach`` mm above
         that. Positioning legs run at ``vel`` percent; the traverse runs at
         ``speed_mms`` mm/s (physical mode) when given — that MoveL IS the weld
-        travel speed. Welding I/O (arc/gas) will hook in around the traverse.
+        travel speed.
 
         ``align_yaw`` rotates rz about base Z so the torch faces the line
         (rx/ry kept). ``pull=True`` — the DEFAULT and the project's welding
         technique — adds 180° so the torch DRAGS against travel (backhand);
         push is for experiments only.
+
+        With ``weld``, the traverse becomes a weld stroke: the arc is struck at
+        P1 (weld_start) and ended at P2 (weld_end). weld_end runs in a finally,
+        so the arc is ALWAYS dropped — even if the traverse errors or the worker
+        is torn down. If the arc does not establish, the pass aborts with no
+        traverse. WeldParams defaults to a DRY weld (live=False): identical
+        motion, nothing energized.
 
         Raises RobotError on the first failed leg (remaining legs are skipped).
         """
@@ -323,10 +359,12 @@ class RobotController:
                     rx, ry, rz]
 
         tspeed = f"{speed_mms:.0f} mm/s" if speed_mms is not None else f"{vel:.0f}%"
+        wtag = ("" if weld is None else
+                (" WELD LIVE" if weld.live else " WELD dry-run"))
         self.log(
             f"Line pass P1({p1[0]:.1f},{p1[1]:.1f},{p1[2]:.1f}) → "
             f"P2({p2[0]:.1f},{p2[1]:.1f},{p2[2]:.1f}) standoff=+{standoff:.0f}mm "
-            f"approach=+{approach:.0f}mm traverse={tspeed}", "info")
+            f"approach=+{approach:.0f}mm traverse={tspeed}{wtag}", "info")
 
         def leg(label: str, target, leg_speed_mms: float | None = None) -> None:
             ret = self._movel(target, vel, leg_speed_mms, accel)
@@ -339,8 +377,110 @@ class RobotController:
 
         leg("approach over P1", point(p1, approach))
         leg("descend to P1", point(p1))
-        leg("traverse to P2", point(p2), speed_mms)
+
+        # Weld stroke: strike at P1, traverse, end at P2. weld_end sits in the
+        # finally so the arc NEVER stays lit, whatever happens to the traverse.
+        try:
+            if weld is not None:
+                self.weld_start(weld)
+            leg("traverse to P2" + (" (WELD stroke)" if weld is not None else ""),
+                point(p2), speed_mms)
+        finally:
+            if weld is not None:
+                self.weld_end(weld)
+
         leg("retract over P2", point(p2, approach))
+
+    # --- welding I/O ----------------------------------------------------------
+    #
+    # Ported from farino_app test_weld_pass.py / red_line_viewer.py. The welder
+    # signals live on the CO output bank (arc=CO0, wire fwd=CO1, wire rev=CO2,
+    # gas=CO3), which is BLOCKED for plain SetDO ("channel configured function")
+    # — these dedicated welding commands are the ONLY way to drive them.
+    # A weld pass is: descend to P1 → weld_start → traverse (the travel speed
+    # IS that MoveL) → weld_end → retract; see move_along_line(weld=...).
+
+    def set_weld_current(self, amps: float, io: int = 0) -> int:
+        """Override the welding current (A) on AO0 (bypasses the WebApp process)."""
+        self._require_connection()
+        ret = self.robot.WeldingSetCurrent(io, float(amps), 0, 0)   # AO0 = current
+        self.log(f"WeldingSetCurrent {amps:.0f} A → {ret}", _ret_level(ret))
+        return ret
+
+    def set_weld_voltage(self, volts: float, io: int = 0) -> int:
+        """Override the welding voltage (V) on AO1 (bypasses the WebApp process)."""
+        self._require_connection()
+        ret = self.robot.WeldingSetVoltage(io, float(volts), 1, 0)  # AO1 = voltage
+        self.log(f"WeldingSetVoltage {volts:.1f} V → {ret}", _ret_level(ret))
+        return ret
+
+    def set_gas(self, on: bool, io: int = 0) -> int:
+        """Open/close the shielding gas valve (CO3 via SetAspirated)."""
+        self._require_connection()
+        ret = self.robot.SetAspirated(io, 1 if on else 0)
+        self.log(f"Gas {'ON' if on else 'OFF'} → {ret}", _ret_level(ret))
+        return ret
+
+    def start_wire_feed(self, reverse: bool = False, io: int = 0) -> int:
+        """Run the wire feeder (cold, no arc): forward feeds, reverse retracts."""
+        self._require_connection()
+        if reverse:
+            ret = self.robot.SetReverseWireFeed(io, 1)
+        else:
+            ret = self.robot.SetForwardWireFeed(io, 1)
+        self.log(f"Wire feed {'REVERSE' if reverse else 'FORWARD'} → {ret}",
+                 _ret_level(ret))
+        return ret
+
+    def stop_wire_feed(self, io: int = 0) -> int:
+        """Stop the wire feeder (clears BOTH directions)."""
+        self._require_connection()
+        ret_fwd = self.robot.SetForwardWireFeed(io, 0)
+        ret_rev = self.robot.SetReverseWireFeed(io, 0)
+        ret = ret_fwd or ret_rev
+        self.log(f"Wire feed STOP → {ret}", _ret_level(ret))
+        return ret
+
+    def weld_start(self, w: WeldParams) -> None:
+        """Strike the arc for a weld stroke: current/voltage → gas → ARCStart.
+
+        With ``w.live`` False this is a DRY WELD — the steps are logged but
+        nothing is energized, so the surrounding motion is identical to a real
+        pass. Raises RobotError if the arc does not establish (the caller must
+        NOT traverse in that case).
+        """
+        self._require_connection()
+        if not w.live:
+            self.log("[dry weld] would set current/voltage, open gas, ARCStart "
+                     "(nothing energized)", "info")
+            return
+        if w.current is not None:
+            self.set_weld_current(w.current, w.io)
+        if w.voltage is not None:
+            self.set_weld_voltage(w.voltage, w.io)
+        if w.gas:
+            self.set_gas(True, w.io)
+        self.log(f"ARCStart (process #{w.arc_num}) …", "info")
+        ret = self.robot.ARCStart(w.io, w.arc_num, w.timeout_ms)
+        self.log(f"ARCStart returned {ret}", _ret_level(ret))
+        if ret != 0:
+            raise RobotError(f"Arc did not establish (ARCStart error {ret}).")
+
+    def weld_end(self, w: WeldParams) -> None:
+        """End the arc and shut the gas. NEVER raises — safe to call twice and
+        from a finally block, so the arc can always be dropped on any exit."""
+        if not w.live:
+            self.log("[dry weld] would ARCEnd + close gas", "info")
+            return
+        if self.robot is None:
+            return
+        ret = self.robot.ARCEnd(w.io, w.arc_num, w.timeout_ms)
+        self.log(f"ARCEnd returned {ret}", _ret_level(ret))
+        if w.gas:
+            try:
+                self.set_gas(False, w.io)
+            except Exception:  # noqa: BLE001 — gas-off is best-effort cleanup
+                pass
 
     # --- helpers ------------------------------------------------------------
 

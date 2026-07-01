@@ -38,7 +38,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 
-from omnicron_ui.robot.controller import RobotController
+from omnicron_ui.robot.controller import RobotController, WeldParams
 
 # A job body: takes the controller, returns anything (delivered via job_done).
 JobFn = Callable[[RobotController], Any]
@@ -149,17 +149,36 @@ class RobotService(QObject):
         )
 
     def move_along_line(self, p1, p2, vel: float = 20.0,
-                        speed_mms: float | None = None, **kwargs) -> None:
+                        speed_mms: float | None = None,
+                        weld: WeldParams | None = None, **kwargs) -> None:
         """Seam pass P1→P2 (approach/descend/traverse/retract; worker thread).
 
         Endpoints are camera-derived base-frame XYZ. Traverse runs at
         ``speed_mms`` (physical mode) when given — the weld travel speed.
+        Pass ``weld`` (WeldParams) to make the traverse a weld stroke; the
+        default WeldParams is a DRY weld (live=False, nothing energized).
         """
         self.submit(
             "line_pass",
             lambda ctrl: ctrl.move_along_line(p1, p2, vel=vel,
-                                              speed_mms=speed_mms, **kwargs),
+                                              speed_mms=speed_mms, weld=weld,
+                                              **kwargs),
         )
+
+    # Welding I/O primitives — for bring-up sequences run by program logic
+    # (wire tension, gas check), not for direct-control UI.
+
+    def set_gas(self, on: bool) -> None:
+        """Open/close the shielding gas valve (worker thread)."""
+        self.submit("gas", lambda ctrl: ctrl.set_gas(on))
+
+    def start_wire_feed(self, reverse: bool = False) -> None:
+        """Run the wire feeder cold (no arc); reverse retracts the wire."""
+        self.submit("wire_feed", lambda ctrl: ctrl.start_wire_feed(reverse))
+
+    def stop_wire_feed(self) -> None:
+        """Stop the wire feeder (both directions)."""
+        self.submit("wire_stop", lambda ctrl: ctrl.stop_wire_feed())
 
     def shutdown(self) -> None:
         """Stop the worker thread cleanly. Call from the UI thread on app exit."""

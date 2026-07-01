@@ -21,10 +21,12 @@ import pytest
 from omnicron_ui.robot import controller as controller_mod
 from omnicron_ui.robot import geometry
 from omnicron_ui.robot.controller import (
+    ARC_TIMEOUT_MS,
     DEFAULT_VEL,
     HOME_JOINTS,
     RobotController,
     RobotError,
+    WeldParams,
 )
 
 CURRENT_TCP = [400.0, -100.0, 300.0, 180.0, 0.0, 90.0]
@@ -43,6 +45,8 @@ class FakeRPC:
         self.movel_ret: int | list[int] = 0
         self.ik_ret: tuple = (0, list(IK_JOINTS))
         self.ik_solver = None  # optional fn(pose) -> (err, joints); wins over ik_ret
+        self.arc_start_ret = 0
+        self.events: list[tuple] = []  # ordered motion + welding I/O calls
 
     def GetActualTCPPose(self):  # noqa: N802 — SDK naming
         return 0, list(CURRENT_TCP)
@@ -71,9 +75,40 @@ class FakeRPC:
             {"desc_pos": list(desc_pos), "tool": tool, "user": user, "vel": vel,
              "acc": acc, "ovl": ovl, "oacc": oacc, "mode": velAccParamMode}
         )
+        self.events.append(("MoveL", list(desc_pos)))
         if isinstance(self.movel_ret, list):  # one return code per successive call
             return self.movel_ret[len(self.movel_calls) - 1]
         return self.movel_ret
+
+    # Welding I/O — CO bank is driven only through these dedicated commands.
+
+    def WeldingSetCurrent(self, io, amps, ao, wait):  # noqa: N802
+        self.events.append(("WeldingSetCurrent", io, amps, ao, wait))
+        return 0
+
+    def WeldingSetVoltage(self, io, volts, ao, wait):  # noqa: N802
+        self.events.append(("WeldingSetVoltage", io, volts, ao, wait))
+        return 0
+
+    def SetAspirated(self, io, on):  # noqa: N802
+        self.events.append(("SetAspirated", io, on))
+        return 0
+
+    def ARCStart(self, io, arc_num, timeout):  # noqa: N802
+        self.events.append(("ARCStart", io, arc_num, timeout))
+        return self.arc_start_ret
+
+    def ARCEnd(self, io, arc_num, timeout):  # noqa: N802
+        self.events.append(("ARCEnd", io, arc_num, timeout))
+        return 0
+
+    def SetForwardWireFeed(self, io, on):  # noqa: N802
+        self.events.append(("SetForwardWireFeed", io, on))
+        return 0
+
+    def SetReverseWireFeed(self, io, on):  # noqa: N802
+        self.events.append(("SetReverseWireFeed", io, on))
+        return 0
 
     def ResetAllError(self):  # noqa: N802
         return 0
@@ -109,6 +144,10 @@ def ctrl(rpc: FakeRPC) -> RobotController:
         lambda c: c.move_linear(400.0, 0.0, 300.0),
         lambda c: c.move_linear_torch_down(400.0, 0.0, 300.0),
         lambda c: c.move_along_line([0.0, 600.0, 80.0], [100.0, 600.0, 80.0]),
+        lambda c: c.set_gas(True),
+        lambda c: c.start_wire_feed(),
+        lambda c: c.stop_wire_feed(),
+        lambda c: c.weld_start(WeldParams(live=True)),
         lambda c: c.reset_error(),
     ],
 )
@@ -342,6 +381,124 @@ def test_line_pass_aborts_on_first_failed_leg(ctrl, rpc):
     with pytest.raises(RobotError, match="descend to P1"):
         ctrl.move_along_line(LINE_P1, LINE_P2, align_yaw=False)
     assert len(rpc.movel_calls) == 2  # traverse/retract never sent
+
+
+# --- welding I/O ----------------------------------------------------------------
+
+
+def _event_names(rpc) -> list[str]:
+    return [e[0] for e in rpc.events]
+
+
+def test_weld_params_default_to_dry_run():
+    """Safe by default: a bare WeldParams energizes nothing."""
+    w = WeldParams()
+    assert w.live is False
+    assert w.gas is False
+    assert w.current is None and w.voltage is None
+
+
+def test_dry_weld_start_end_energize_nothing(ctrl, rpc):
+    w = WeldParams(current=100.0, voltage=18.0, gas=True)  # still live=False
+    ctrl.weld_start(w)
+    ctrl.weld_end(w)
+    assert rpc.events == []  # not a single welding command sent
+
+
+def test_live_weld_start_sets_ao_then_gas_then_arc(ctrl, rpc):
+    w = WeldParams(live=True, gas=True, current=65.0, voltage=16.5, arc_num=2)
+    ctrl.weld_start(w)
+
+    assert rpc.events == [
+        ("WeldingSetCurrent", 0, 65.0, 0, 0),  # AO0 = current
+        ("WeldingSetVoltage", 0, 16.5, 1, 0),  # AO1 = voltage
+        ("SetAspirated", 0, 1),                # gas before the arc
+        ("ARCStart", 0, 2, ARC_TIMEOUT_MS),
+    ]
+
+
+def test_live_weld_uses_webapp_process_when_no_overrides(ctrl, rpc):
+    """No current/voltage given → they come from the arc_num process, not AO writes."""
+    ctrl.weld_start(WeldParams(live=True))
+    assert _event_names(rpc) == ["ARCStart"]
+
+
+def test_weld_start_raises_when_arc_fails(ctrl, rpc):
+    rpc.arc_start_ret = 1
+    with pytest.raises(RobotError, match="Arc did not establish"):
+        ctrl.weld_start(WeldParams(live=True))
+
+
+def test_weld_end_drops_arc_then_gas(ctrl, rpc):
+    ctrl.weld_end(WeldParams(live=True, gas=True))
+    assert rpc.events == [
+        ("ARCEnd", 0, 1, ARC_TIMEOUT_MS),
+        ("SetAspirated", 0, 0),
+    ]
+
+
+def test_weld_end_never_raises_even_disconnected():
+    # weld_end must be safe from a finally block on ANY exit path.
+    c = RobotController(log=lambda msg, level="info": None)
+    c.weld_end(WeldParams(live=True))  # no connection: no-op, no exception
+
+
+def test_wire_feed_forward_and_stop(ctrl, rpc):
+    ctrl.start_wire_feed()
+    ctrl.stop_wire_feed()
+    assert rpc.events == [
+        ("SetForwardWireFeed", 0, 1),
+        ("SetForwardWireFeed", 0, 0),  # stop clears BOTH directions
+        ("SetReverseWireFeed", 0, 0),
+    ]
+
+
+def test_wire_feed_reverse(ctrl, rpc):
+    ctrl.start_wire_feed(reverse=True)
+    assert rpc.events == [("SetReverseWireFeed", 0, 1)]
+
+
+# --- weld pass (move_along_line + weld) ---------------------------------------------
+
+
+def test_weld_pass_arc_wraps_the_traverse_only(ctrl, rpc):
+    """Arc strikes after the descend, ends before the retract."""
+    ctrl.move_along_line(LINE_P1, LINE_P2, align_yaw=False,
+                         weld=WeldParams(live=True, gas=True))
+    assert _event_names(rpc) == [
+        "MoveL",         # approach over P1
+        "MoveL",         # descend to P1
+        "SetAspirated",  # gas on
+        "ARCStart",
+        "MoveL",         # traverse = weld stroke
+        "ARCEnd",
+        "SetAspirated",  # gas off
+        "MoveL",         # retract over P2
+    ]
+
+
+def test_weld_pass_dry_run_is_pure_motion(ctrl, rpc):
+    ctrl.move_along_line(LINE_P1, LINE_P2, align_yaw=False, weld=WeldParams())
+    assert _event_names(rpc) == ["MoveL"] * 4  # identical path, nothing energized
+
+
+def test_weld_pass_no_traverse_when_arc_fails(ctrl, rpc):
+    rpc.arc_start_ret = 1
+    with pytest.raises(RobotError, match="Arc did not establish"):
+        ctrl.move_along_line(LINE_P1, LINE_P2, align_yaw=False,
+                             weld=WeldParams(live=True))
+    # Approach + descend happened; after the failed strike the finally still
+    # sends ARCEnd, and the traverse/retract never run.
+    assert _event_names(rpc) == ["MoveL", "MoveL", "ARCStart", "ARCEnd"]
+
+
+def test_weld_pass_arc_always_ended_when_traverse_fails(ctrl, rpc):
+    rpc.movel_ret = [0, 0, 112]  # approach OK, descend OK, traverse fails
+    with pytest.raises(RobotError, match="traverse"):
+        ctrl.move_along_line(LINE_P1, LINE_P2, align_yaw=False,
+                             weld=WeldParams(live=True))
+    # The arc is dropped even though the weld stroke errored mid-pass.
+    assert _event_names(rpc) == ["MoveL", "MoveL", "ARCStart", "MoveL", "ARCEnd"]
 
 
 # --- connect ------------------------------------------------------------------
