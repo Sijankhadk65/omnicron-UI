@@ -34,3 +34,9 @@ extend-exclude = ["fairino_sdk"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008", "B904"]
+
+[tool.pytest.ini_options]
+# Only collect the unit-test suite. scripts/ holds interactive HARDWARE tests
+# (test_motion.py, test_home_motion.py) run directly against a live robot, not
+# via pytest — their test_* functions take a controller arg, not a fixture.
+testpaths = ["tests"]
