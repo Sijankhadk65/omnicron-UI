@@ -46,7 +46,7 @@ DEFAULT_ACCEL = 200.0
 
 # The "home" joint configuration the program parks the arm at between tasks.
 # Same pose used by farino_app; joint values in degrees [j1..j6].
-HOME_JOINTS = [-90.0, -90.0, 85.0, -85.0, -90.0, 0.0]
+HOME_JOINTS = [-90.0, -120, 85.0, -60.0, -90.0, 0.0]
 
 # Arc strike/extinguish timeout for ARCStart/ARCEnd (ms).
 ARC_TIMEOUT_MS = 10000
